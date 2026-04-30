@@ -36,6 +36,179 @@ private let _geluMul: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
     geluApproximate(gate) * other
 }
 
+// MARK: - Fused q4 gate+up+geglu Metal kernel
+//
+// On batch=1 / seq=1 decode, the MLP `gate_proj + up_proj + gelu * up`
+// dispatches three GPU kernels (two q4 matmuls + an elementwise activation),
+// touches `intermediate * 2` bf16 of intermediate tensors, and pays per-launch
+// overhead for each. This custom kernel folds them into one launch:
+//
+//   - load each x lane once into thread storage (shared across both rows of
+//     the MLP), reusing the q4 dot-product layout from mlx core's qmv_fast_impl
+//     (mlx/backend/metal/kernels/quantized.h): num_simdgroups=2,
+//     results_per_simdgroup=4, packs_per_thread=2, block_size=512.
+//   - accumulate gate and up dot products in parallel registers.
+//   - after simd_sum, lane 0 of each row writes
+//     `gated[row] = gelu_approx(g) * u` directly, skipping the two
+//     intermediate activation tensors entirely.
+//
+// Eligibility is narrow on purpose: batch=1, seq=1, bf16, 4-bit/group=64
+// quantized linears with both biases (the only layout shipped by every
+// Gemma 4 mlx-community/unsloth weight at this time), and `hidden % 512 == 0`,
+// `intermediate % 8 == 0`. Anything outside these bounds falls back to the
+// reference path.
+
+private let _fusedGateUpGegluHeader = """
+constant constexpr int SIMD_SIZE = 32;
+constant constexpr int PACK_FACTOR = 8;
+constant constexpr int BYTES_PER_PACK = 4;
+constant constexpr int PACKS_PER_THREAD = 2;
+constant constexpr int VALUES_PER_THREAD = 16;
+constant constexpr int BLOCK_SIZE = 512;
+constant constexpr int RESULTS_PER_SIMDGROUP = 4;
+constant constexpr int ROWS_PER_TG = 8;
+constant constexpr int GROUP_SIZE = 64;
+constant constexpr int SCALE_STEP_PER_THREAD = 4;
+
+inline float fused_load_vec(const device bfloat16_t* x, thread float* x_thread) {
+    float sum = 0.0f;
+    for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
+        float a = (float)x[i];
+        float b = (float)x[i + 1];
+        float c = (float)x[i + 2];
+        float d = (float)x[i + 3];
+        sum += a + b + c + d;
+        x_thread[i]     = a;
+        x_thread[i + 1] = b / 16.0f;
+        x_thread[i + 2] = c / 256.0f;
+        x_thread[i + 3] = d / 4096.0f;
+    }
+    return sum;
+}
+
+inline float fused_qdot4(
+    const device uint8_t* w,
+    const thread float* x_thread,
+    float scale, float bias, float sum)
+{
+    const device uint16_t* ws = (const device uint16_t*)w;
+    float accum = 0.0f;
+    for (int i = 0; i < (VALUES_PER_THREAD / 4); i++) {
+        accum +=
+            (x_thread[4 * i]     * (ws[i] & 0x000f) +
+             x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
+             x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
+             x_thread[4 * i + 3] * (ws[i] & 0xf000));
+    }
+    return scale * accum + sum * bias;
+}
+"""
+
+private let _fusedGateUpGegluBody = """
+    const uint tid_y = threadgroup_position_in_grid.y;
+    const uint local_id = thread_position_in_threadgroup.x;
+    const uint simd_gid = local_id / SIMD_SIZE;
+    const uint simd_lid = local_id % SIMD_SIZE;
+
+    const uint in_vec_size_w = HIDDEN * BYTES_PER_PACK / PACK_FACTOR;
+    const uint in_vec_size_g = HIDDEN / GROUP_SIZE;
+    const uint out_row = tid_y * ROWS_PER_TG + simd_gid * RESULTS_PER_SIMDGROUP;
+
+    const device uint8_t* gw = (const device uint8_t*)gate_w
+        + out_row * in_vec_size_w + simd_lid * PACKS_PER_THREAD * BYTES_PER_PACK;
+    const device uint8_t* uw = (const device uint8_t*)up_w
+        + out_row * in_vec_size_w + simd_lid * PACKS_PER_THREAD * BYTES_PER_PACK;
+    const device bfloat16_t* gs = gate_s + out_row * in_vec_size_g + simd_lid / SCALE_STEP_PER_THREAD;
+    const device bfloat16_t* gb = gate_b + out_row * in_vec_size_g + simd_lid / SCALE_STEP_PER_THREAD;
+    const device bfloat16_t* us = up_s   + out_row * in_vec_size_g + simd_lid / SCALE_STEP_PER_THREAD;
+    const device bfloat16_t* ub = up_b   + out_row * in_vec_size_g + simd_lid / SCALE_STEP_PER_THREAD;
+    const device bfloat16_t* xp = x + simd_lid * VALUES_PER_THREAD;
+
+    thread float x_thread[VALUES_PER_THREAD];
+    thread float g_acc[RESULTS_PER_SIMDGROUP] = {0};
+    thread float u_acc[RESULTS_PER_SIMDGROUP] = {0};
+
+    for (uint k = 0; k < HIDDEN; k += BLOCK_SIZE) {
+        float xsum = fused_load_vec(xp, x_thread);
+        for (uint row = 0; row < RESULTS_PER_SIMDGROUP; row++) {
+            const device uint8_t* gwl = gw + row * in_vec_size_w;
+            const device uint8_t* uwl = uw + row * in_vec_size_w;
+            float gscale = (float)gs[row * in_vec_size_g];
+            float gbias  = (float)gb[row * in_vec_size_g];
+            float uscale = (float)us[row * in_vec_size_g];
+            float ubias  = (float)ub[row * in_vec_size_g];
+            g_acc[row] += fused_qdot4(gwl, x_thread, gscale, gbias, xsum);
+            u_acc[row] += fused_qdot4(uwl, x_thread, uscale, ubias, xsum);
+        }
+        gw += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
+        uw += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
+        gs += BLOCK_SIZE / GROUP_SIZE;
+        gb += BLOCK_SIZE / GROUP_SIZE;
+        us += BLOCK_SIZE / GROUP_SIZE;
+        ub += BLOCK_SIZE / GROUP_SIZE;
+        xp += BLOCK_SIZE;
+    }
+
+    for (uint row = 0; row < RESULTS_PER_SIMDGROUP; row++) {
+        float g = simd_sum(g_acc[row]);
+        float u = simd_sum(u_acc[row]);
+        if (simd_lid == 0) {
+            float t = 0.7978845608f * (g + 0.044715f * g * g * g);
+            float gelu_g = 0.5f * g * (1.0f + metal::tanh(t));
+            gated[out_row + row] = (bfloat16_t)(gelu_g * u);
+        }
+    }
+"""
+
+// Cache compiled kernels per (hidden, intermediate) shape. Inference is
+// single-threaded from the harness's perspective, so simple unsynchronized
+// access is fine; if the model is ever evaluated from multiple threads
+// concurrently we would race here.
+private nonisolated(unsafe) var _fusedKernelCache: [String: MLXFast.MLXFastKernel] = [:]
+
+private func _getFusedGateUpKernel(hidden: Int, intermediate: Int) -> MLXFast.MLXFastKernel {
+    let key = "h\(hidden)_i\(intermediate)"
+    if let k = _fusedKernelCache[key] { return k }
+    let header = _fusedGateUpGegluHeader
+        + "\nconstant constexpr int HIDDEN = \(hidden);"
+        + "\nconstant constexpr int INTERMEDIATE = \(intermediate);\n"
+    let k = MLXFast.metalKernel(
+        name: "fused_gateup_geglu_q4_\(key)",
+        inputNames: ["x", "gate_w", "gate_s", "gate_b", "up_w", "up_s", "up_b"],
+        outputNames: ["gated"],
+        source: _fusedGateUpGegluBody,
+        header: header
+    )
+    _fusedKernelCache[key] = k
+    return k
+}
+
+/// Run the fused q4 gate+up+geglu kernel if the inputs are eligible
+/// (batch=1, seq=1, bf16, 4-bit/group=64 quantized, expected divisibility).
+/// Returns nil if the path isn't supported (caller should fall back).
+private func _fusedGateUpGeglu(
+    x: MLXArray, gate: QuantizedLinear, up: QuantizedLinear, intermediate: Int
+) -> MLXArray? {
+    guard
+        x.dtype == .bfloat16,
+        x.shape.count == 3, x.shape[0] == 1, x.shape[1] == 1,
+        gate.bits == 4, gate.groupSize == 64,
+        up.bits == 4, up.groupSize == 64,
+        let gateBiases = gate.biases, let upBiases = up.biases
+    else { return nil }
+    let hidden = x.shape[2]
+    if hidden % 512 != 0 || intermediate % 8 != 0 { return nil }
+    let kernel = _getFusedGateUpKernel(hidden: hidden, intermediate: intermediate)
+    let out = kernel(
+        [x, gate.weight, gate.scales, gateBiases, up.weight, up.scales, upBiases],
+        grid: (64, intermediate / 8, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[1, 1, intermediate]],
+        outputDTypes: [x.dtype]
+    )
+    return out[0]
+}
+
 // MARK: - Configuration
 
 public struct Gemma4TextConfiguration: Codable, Sendable {
@@ -383,11 +556,13 @@ private class Gemma4MLP: Module {
     @ModuleInfo(key: "up_proj") var upProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
 
+    let intermediateSize: Int
+
     init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
         let firstKvSharedLayerIdx = config.numHiddenLayers - config.numKvSharedLayers
         let isKvSharedLayer = layerIdx >= firstKvSharedLayerIdx && firstKvSharedLayerIdx > 0
         let useDoubleWide = config.useDoubleWideMlp && isKvSharedLayer
-        let intermediateSize = config.intermediateSize * (useDoubleWide ? 2 : 1)
+        self.intermediateSize = config.intermediateSize * (useDoubleWide ? 2 : 1)
 
         self._gateProj.wrappedValue = Linear(config.hiddenSize, intermediateSize, bias: false)
         self._downProj.wrappedValue = Linear(intermediateSize, config.hiddenSize, bias: false)
@@ -397,7 +572,13 @@ private class Gemma4MLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(geluApproximate(gateProj(x)) * upProj(x))
+        // Fast path: fused q4 gate+up+geglu kernel for single-token decode.
+        if let g = gateProj as? QuantizedLinear, let u = upProj as? QuantizedLinear,
+            let gated = _fusedGateUpGeglu(x: x, gate: g, up: u, intermediate: intermediateSize)
+        {
+            return downProj(gated)
+        }
+        return downProj(geluApproximate(gateProj(x)) * upProj(x))
     }
 }
 
