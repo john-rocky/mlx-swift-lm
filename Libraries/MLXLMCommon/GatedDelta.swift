@@ -11,7 +11,8 @@ import MLXNN
 
 // MARK: - Compute G
 
-func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
+public func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray
+{
     let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
     return decay.asType(a.dtype)
 }
@@ -119,7 +120,7 @@ private final class GatedDeltaKernelManager: Sendable {
 
 // MARK: - Kernel Dispatch
 
-func gatedDeltaKernel(
+public func gatedDeltaKernel(
     q: MLXArray,
     k: MLXArray,
     v: MLXArray,
@@ -211,7 +212,7 @@ private func gatedDeltaStepOps(
     return (y, state)
 }
 
-func gatedDeltaOps(
+public func gatedDeltaOps(
     q: MLXArray,
     k: MLXArray,
     v: MLXArray,
@@ -268,7 +269,7 @@ func gatedDeltaOps(
 
 // MARK: - Public API
 
-func gatedDeltaUpdate(
+public func gatedDeltaUpdate(
     q: MLXArray,
     k: MLXArray,
     v: MLXArray,
