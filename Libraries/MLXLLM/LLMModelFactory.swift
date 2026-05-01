@@ -76,6 +76,10 @@ public enum LLMTypeRegistry {
         "jamba_3b": create(JambaConfiguration.self, JambaModel.init),
         "mistral3": create(Mistral3TextConfiguration.self, Mistral3TextModel.init),
         "apertus": create(ApertusConfiguration.self, ApertusModel.init),
+        "t5": create(T5Configuration.self, T5Model.init),
+        "mt5": create(T5Configuration.self, T5Model.init),
+        "byt5": create(T5Configuration.self, T5Model.init),
+        "umt5": create(T5Configuration.self, T5Model.init),
     ])
 }
 

@@ -649,6 +649,10 @@ public struct TokenIterator: TokenIteratorProtocol {
             asyncEval(y.tokens)
 
         case .logits(let result):
+            // Carry forward any state set by the model in `prepare(...)` (e.g.
+            // encoder output for encoder-decoder models like T5) so that
+            // subsequent `step(...)` calls see it.
+            self.state = result.state
             y = .init(tokens: convertToToken(logits: result.logits))
             asyncEval(y.tokens)
 
