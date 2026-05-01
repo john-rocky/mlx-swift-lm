@@ -161,6 +161,49 @@ public class T5Tests: XCTestCase {
         )
     }
 
+    // MARK: - Real-world Configuration Decoding
+
+    /// Smoke-test that a real `config.json` (from `mlx-community/flan-t5-small-mlx-4bit`,
+    /// FLAN-T5 v1.1 family) decodes through `T5Configuration` without
+    /// throwing. FLAN-T5 v1.1 uses `gated-gelu` activation and untied
+    /// embeddings, both of which exercise edge cases of our decoder path.
+    func testRealFlanT5SmallConfigurationDecodes() throws {
+        let realConfigJSON = """
+            {
+              "d_ff": 1024,
+              "d_kv": 64,
+              "d_model": 512,
+              "decoder_start_token_id": 0,
+              "eos_token_id": 1,
+              "feed_forward_proj": "gated-gelu",
+              "is_encoder_decoder": true,
+              "layer_norm_epsilon": 1e-06,
+              "model_type": "t5",
+              "n_positions": 512,
+              "num_decoder_layers": 8,
+              "num_heads": 6,
+              "num_layers": 8,
+              "pad_token_id": 0,
+              "relative_attention_max_distance": 128,
+              "relative_attention_num_buckets": 32,
+              "tie_word_embeddings": false,
+              "use_cache": true,
+              "vocab_size": 32128
+            }
+            """
+        let data = try XCTUnwrap(realConfigJSON.data(using: .utf8))
+        let config = try JSONDecoder().decode(T5Configuration.self, from: data)
+
+        // Instantiation must succeed against the same config the loader will see.
+        let model = T5Model(config)
+
+        // For tie_word_embeddings == false we expect an lm_head to be wired up.
+        // Sanitize a (non-quantized) lm_head weight and confirm it survives.
+        let placeholder = MLXArray.zeros([1])
+        let sanitized = model.sanitize(weights: ["lm_head.weight": placeholder])
+        XCTAssertNotNil(sanitized["lm_head.weight"])
+    }
+
     // MARK: - Forward / Generation Shape Tests
 
     /// `prepare(...)` should produce logits of shape (B, 1, vocabSize) and stash the
