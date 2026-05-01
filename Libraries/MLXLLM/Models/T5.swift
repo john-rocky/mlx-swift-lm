@@ -496,7 +496,18 @@ public class T5Model: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        // Map HF T5 key layout onto our Swift module hierarchy.
+        // Map HF T5 / mlx-examples T5 layouts onto our Swift module hierarchy.
+        //
+        // Two upstream layouts are seen in the wild:
+        // - HuggingFace original (e.g. `t5-base`): uses `block`, `layer.{0,1,2}.layer_norm`,
+        //   `SelfAttention`, `EncDecAttention`, `DenseReluDense`, `final_layer_norm`,
+        //   `shared.weight` for the embedding, etc.
+        // - mlx-examples conversions (e.g. `mlx-community/flan-t5-small-mlx-4bit`):
+        //   already pre-renamed onto the mlx-examples T5 schema, so most of the
+        //   patterns below are no-ops for these. The one residual difference is
+        //   `lm_head.linear.X` (mlx-examples wraps the head in an `OutputHead` with
+        //   an inner `linear`) which we strip down to `lm_head.X` because we keep
+        //   the head as a bare `Linear`.
         let sharedReplacements: [(String, String)] = [
             (".block.", ".layers."),
             (".k.", ".key_proj."),
@@ -504,7 +515,7 @@ public class T5Model: Module, LLMModel, KVCacheDimensionProvider {
             (".q.", ".query_proj."),
             (".v.", ".value_proj."),
             ("shared.", "wte."),
-            ("lm_head.", "lm_head."),
+            ("lm_head.linear.", "lm_head."),
             (".layer.0.layer_norm.", ".ln1."),
             (".layer.1.layer_norm.", ".ln2."),
             (".layer.2.layer_norm.", ".ln3."),

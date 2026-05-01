@@ -204,6 +204,106 @@ public class T5Tests: XCTestCase {
         XCTAssertNotNil(sanitized["lm_head.weight"])
     }
 
+    // MARK: - Real-weight Load + Generation Test (skipped when model not in HF cache)
+
+    /// End-to-end integration test against `mlx-community/flan-t5-small-mlx-4bit`.
+    /// Loads the actual quantized weights, runs `prepare(...)` followed by greedy
+    /// decoding, and checks the first generated token id matches the Python
+    /// reference (mlx-examples T5).
+    ///
+    /// Skipped automatically when the model is not present in the local
+    /// HuggingFace cache, so this is safe to run in any environment.
+    func testLoadFlanT5SmallAndGenerateMatchesPythonReference() throws {
+        let homeDir = ProcessInfo.processInfo.environment["HOME"] ?? "/Users/majimadaisuke"
+        let snapshotsDir = URL(fileURLWithPath:
+            "\(homeDir)/.cache/huggingface/hub/models--mlx-community--flan-t5-small-mlx-4bit/snapshots")
+        guard
+            let snap = try? FileManager.default.contentsOfDirectory(
+                at: snapshotsDir, includingPropertiesForKeys: nil
+            ).first,
+            FileManager.default.fileExists(atPath: snap.appendingPathComponent("config.json").path),
+            FileManager.default.fileExists(
+                atPath: snap.appendingPathComponent("model.safetensors").path)
+        else {
+            throw XCTSkip(
+                "mlx-community/flan-t5-small-mlx-4bit not in local HF cache; skipping E2E test")
+        }
+
+        // Load T5 config.
+        let configData = try Data(
+            contentsOf: snap.appendingPathComponent("config.json"))
+        let config = try JSONDecoder().decode(T5Configuration.self, from: configData)
+
+        // Decode the quantization block separately (BaseConfiguration handles this for the
+        // factory path; here we re-parse the same JSON to keep the test self-contained).
+        let baseConfig = try JSONDecoder().decode(BaseConfiguration.self, from: configData)
+
+        let model = T5Model(config)
+        try loadWeights(
+            modelDirectory: snap,
+            model: model,
+            quantization: baseConfig.quantization,
+            perLayerQuantization: baseConfig.perLayerQuantization
+        )
+
+        // Reference input ids: tokenizer.encode("translate English to German: That is good.")
+        // for the `t5-small` family.
+        let refInputIds: [Int32] = [13959, 1566, 12, 2968, 10, 466, 19, 207, 5, 1]
+        let promptTokens = MLXArray(refInputIds).reshaped(1, refInputIds.count)
+        let input = LMInput(tokens: promptTokens)
+
+        let cache = model.newCache(parameters: nil)
+        let prepareResult = try model.prepare(input, cache: cache, windowSize: nil)
+
+        guard case .logits(let firstStep) = prepareResult else {
+            XCTFail("T5Model.prepare must return .logits")
+            return
+        }
+
+        // Greedy first token must match the Python reference (716, captured from
+        // mlx-examples T5 running the same checkpoint with the same input ids).
+        let logits1D = firstStep.logits[0, -1, 0...]
+        let firstToken = argMax(logits1D, axis: -1).item(Int32.self)
+        XCTAssertEqual(
+            Int(firstToken), 716,
+            "First greedy token must match Python mlx-examples T5 reference"
+        )
+
+        // Encoder output spot-check: Python ref [0,0,:5] ≈ [-0.3616, -0.5402, 0.071, 1.3423, 0.0216].
+        let memory = try XCTUnwrap(firstStep.state?.crossAttentionStates)
+        let memChannel0 = memory[0, 0, 0 ..< 5].asArray(Float.self)
+        let pyExpected: [Float] = [-0.3616, -0.5402, 0.0710, 1.3423, 0.0216]
+        for i in 0 ..< 5 {
+            XCTAssertEqual(
+                memChannel0[i], pyExpected[i], accuracy: 0.05,
+                "Encoder output channel \(i) drifts from Python reference"
+            )
+        }
+
+        // Walk the decoder forward N steps, checking that state.crossAttentionStates is
+        // threaded through each call so the decoded token sequence matches Python's
+        // greedy output.
+        var generated: [Int] = [Int(firstToken)]
+        var lastState: LMOutput.State? = firstStep.state
+        var lastToken = firstToken
+        for _ in 0 ..< 4 {
+            let nextInput = LMInput.Text(tokens: MLXArray([lastToken]).reshaped(1, 1))
+            let stepOut = model.callAsFunction(nextInput, cache: cache, state: lastState)
+            let nextToken = argMax(stepOut.logits[0, -1, 0...], axis: -1).item(Int32.self)
+            generated.append(Int(nextToken))
+            lastState = stepOut.state
+            lastToken = nextToken
+        }
+
+        // Python reference (mlx-examples T5, greedy, same checkpoint+input):
+        //   [716, 30153, 26202, 19935, 30120, ...]
+        let pyTokens = [716, 30153, 26202, 19935, 30120]
+        XCTAssertEqual(
+            generated, pyTokens,
+            "Multi-step greedy token sequence must match Python mlx-examples T5"
+        )
+    }
+
     // MARK: - Forward / Generation Shape Tests
 
     /// `prepare(...)` should produce logits of shape (B, 1, vocabSize) and stash the
